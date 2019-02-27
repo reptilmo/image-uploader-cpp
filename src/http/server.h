@@ -1,6 +1,8 @@
 // connection.h
 #ifndef __IMGUP_SERVER_H__
 #define __IMGUP_SERVER_H__
+#include <memory>
+#include <set>
 #include <boost/asio.hpp>
 
 using namespace boost;
@@ -11,6 +13,9 @@ namespace http
 {
 	struct Header
 	{
+		Header(const char* n, int nlen, const char* v, int vlen)
+			: name(n, nlen), value(v, vlen) {}
+
 		std::string name;
 		std::string value;
 	};
@@ -40,7 +45,6 @@ namespace http
 		
 	private:
 		std::vector<Header> headers;
-
 	};
 
 	class Server
@@ -54,33 +58,36 @@ namespace http
 		void listen_and_serve();
 	
 	private:
-		struct Connection
+		struct Connection : public std::enable_shared_from_this<Connection>
 		{
-			ip::tcp::socket socket;
-			std::array<unsigned char, 8192> buffer;
 			Server* server;
-
+			ip::tcp::socket socket;
+			std::array<char, 8192> buffer;
+			Request request;
+			Response response;
+			
 			Connection(const Connection&) = delete;
 			Connection& operator= (const Connection&) = delete;
 
-			Connection(ip::tcp::socket soc, Server* srv) : socket(std::move(soc)), server(srv) {}
+			Connection(Server* srv, ip::tcp::socket soc) : server(srv), socket(std::move(soc)) {}
 			~Connection() {}
 
-			void run();
+			void start();
+			void stop();
+
 			void read();
 			void write();
 		};
 
 		void accept();
+		void stop_connection(std::shared_ptr<Connection> c);
 
 		io_service context;
 		ip::tcp::endpoint endpoint;
 		ip::tcp::acceptor acceptor;
 		ip::tcp::socket socket;
 
-		using ConnPtr = std::shared_ptr<Connection>;
-		std::vector<ConnPtr> connection_pool;
-
+		std::set<std::shared_ptr<Connection>> connection_pool;
 		std::unordered_map<std::string, std::function<void(const Request&, Response&)>> handlers;
 	};
 	
