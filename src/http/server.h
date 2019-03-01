@@ -1,32 +1,25 @@
 // connection.h
-#ifndef __IMGUP_SERVER_H__
-#define __IMGUP_SERVER_H__
+#ifndef __IMGUP_HTTP_SERVER_H__
+#define __IMGUP_HTTP_SERVER_H__
 #include <memory>
 #include <set>
+#include <vector>
+#include <map>
 #include <boost/asio.hpp>
 
-using namespace boost;
-using namespace boost::system;
 using namespace boost::asio;
+using error_code = boost::system::error_code;
+
 
 namespace http
 {
-	struct Header
-	{
-		Header(const char* n, int nlen, const char* v, int vlen)
-			: name(n, nlen), value(v, vlen) {}
-
-		std::string name;
-		std::string value;
-	};
-
 	struct Request
 	{
 		std::string method;
 		std::string path;
+		std::map<std::string, std::string> headers;
 		uint16_t http_major;
 		uint16_t http_minor;
-		std::vector<Header> headers;
 	};
 
 	struct Response
@@ -39,12 +32,18 @@ namespace http
 			ServerError
 		};
 
+		static const std::string strEndOfLine;
+		static const std::string strStatusGood;
+		static const std::string strStatusBadRequest;
+		static const std::string strStatusNotFound;
+		static const std::string strStatusServerError;
+
+		std::vector<std::string> headers;
+		std::vector<char> body;
 		Status status;
 		void add_header(const char* name, const char* value);
-		void write_response_body(const unsigned char* data, std::size_t len);
-		
-	private:
-		std::vector<Header> headers;
+		void prepare();
+		std::vector<const_buffer> to_buffers();
 	};
 
 	class Server
@@ -54,7 +53,7 @@ namespace http
 		const Server& operator= (const Server&) = delete;
 
 		Server(const char* addr, uint16_t port, const char* doc_root);
-		void add_handler();
+		void add_handler(const char* path, std::function<void(const Request&, Response&)> handler);
 		void listen_and_serve();
 	
 	private:
@@ -70,13 +69,15 @@ namespace http
 			Connection& operator= (const Connection&) = delete;
 
 			Connection(Server* srv, ip::tcp::socket soc) : server(srv), socket(std::move(soc)) {}
-			~Connection() {}
+			~Connection();
 
 			void start();
 			void stop();
 
-			void read();
-			void write();
+			void read_and_write();
+
+			//error_code read_some(const char* buffer, int len);
+			void write(Response& response);
 		};
 
 		void accept();
@@ -92,4 +93,4 @@ namespace http
 	};
 	
 } // namespace http
-#endif // __IMGUP_SERVER_H__
+#endif // __IMGUP_HTTP_SERVER_H__

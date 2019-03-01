@@ -1,0 +1,35 @@
+<!doctype html>
+<style>
+body {
+	background-color: black;
+}
+h3 {
+	color: white;
+	text-align: left;
+}
+.fileUpload {
+	position: relative;
+	margin: 20px;
+}
+.fileUpload input.upload {
+	color: white;
+	font-size: 30px;
+}
+.fileUpload input.uploadBtn {
+	font-size: 30px;
+}
+</style>
+<html>
+<head>
+	<title>Uploader</title>
+</head>
+<body>
+	<h3>Welcome to Uploader!</h3>
+	<div class="fileUpload">
+		<form enctype="multipart/form-data" action="/upload" method="post">
+			<input type="file" name="uploadfiles" class="upload" multiple/>
+			<input type="submit" value="Upload" class="uploadBtn"/>
+		</form>
+	</div>
+</body>
+</html>

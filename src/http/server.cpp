@@ -2,6 +2,7 @@
 #include "server.h"
 #include <memory>
 #include <iostream>
+#include <tuple>
 
 namespace http
 {
@@ -13,7 +14,7 @@ enum class ParserStatus
 	BadRequest
 };
 
-static ParserStatus parseRequest(char* buffer, int len, Request& request)
+static std::tuple<ParserStatus, char*, int> parseRequest(char* buffer, int len, Request& request)
 {
 	char* start = buffer;
 	int offset = 0;
@@ -23,7 +24,7 @@ static ParserStatus parseRequest(char* buffer, int len, Request& request)
 	request.method.assign(start, offset);
 	//NOTE: Only GET, POST and PUT are supported at this time
 	if (request.method != "GET" && request.method != "POST" && request.method != "PUT")
-		return ParserStatus::BadRequest;
+		return std::make_tuple(ParserStatus::BadRequest, nullptr, 0);
 
 	offset += 1;
 	start = start + offset;
@@ -40,7 +41,7 @@ static ParserStatus parseRequest(char* buffer, int len, Request& request)
 
 	while (offset < len && start[offset] != '/') ++offset;
 	if (memcmp(start, "HTTP", offset) != 0)
-		return ParserStatus::BadRequest;
+		return std::make_tuple(ParserStatus::BadRequest, nullptr, 0);
 
 	offset += 1;
 	start = start + offset;
@@ -66,7 +67,7 @@ static ParserStatus parseRequest(char* buffer, int len, Request& request)
 	offset = 0;
 
 	if (start[offset] == '\r' || start[offset] == '\n')
-		return ParserStatus::BadRequest;
+		return std::make_tuple(ParserStatus::BadRequest, nullptr, 0);
 
 	while (len)
 	{
@@ -86,8 +87,8 @@ static ParserStatus parseRequest(char* buffer, int len, Request& request)
 		while (start[offset] != '\r' && start[offset] != '\n') ++offset;
 		int len_header_value = offset;
 
-		request.headers.emplace_back(start_header_name,
-			len_header_name, start_header_value, len_header_value);
+		request.headers.emplace(std::string(start_header_name, len_header_name),
+			std::string(start_header_value, len_header_value));
 
 		offset += 2;
 		start = start + offset;
@@ -95,7 +96,69 @@ static ParserStatus parseRequest(char* buffer, int len, Request& request)
 		offset = 0;
 	}
 
-	return ParserStatus::Done;
+	return std::make_tuple(ParserStatus::Done, nullptr, 0);
+}
+
+const std::string Response::strEndOfLine = "\r\n";
+const std::string Response::strStatusGood = "HTTP/1.0 200 OK\r\n";
+const std::string Response::strStatusBadRequest = "HTTP/1.0 400 Bad Request\r\n";
+const std::string Response::strStatusNotFound = "HTTP/1.0 404 Not Found\r\n";
+const std::string Response::strStatusServerError = "HTTP/1.0 500 Internal Server Error\r\n";
+
+void Response::add_header(const char* name, const char* value)
+{
+	std::string header(name);
+	header.append(": ");
+	header.append(value);
+	header.append("\r\n");
+
+	headers.push_back(std::move(header));
+}
+
+void Response::prepare()
+{
+	if (status == Status::Good || status == Status::NotFound)
+	{
+		std::string sz(std::to_string(body.size()));
+		add_header("Content-Length", sz.c_str());
+	}
+	else
+	{
+		body.clear();
+		add_header("Content-Length", "0");
+	}
+
+	add_header("Content-Type", "text/html");
+}
+
+std::vector<const_buffer> Response::to_buffers()
+{
+	std::vector<boost::asio::const_buffer> buffers;
+	switch (status)
+	{
+		case Status::Good:
+			buffers.push_back(buffer(strStatusGood));
+			break;
+		case Status::BadRequest:
+			buffers.push_back(buffer(strStatusBadRequest));
+			break;
+		case Status::NotFound:
+			buffers.push_back(buffer(strStatusNotFound));
+			break;
+		case Status::ServerError:
+			buffers.push_back(buffer(strStatusServerError));
+			break;
+		default:
+			buffers.push_back(buffer(strStatusServerError));
+			break;
+	}
+
+	for (auto& h : headers)
+		buffers.push_back(buffer(h));
+
+	buffers.push_back(buffer(strEndOfLine));
+	buffers.push_back(buffer(body.data(), body.size()));
+	return buffers;
 }
 
 Server::Server(const char* addr, uint16_t port, const char* doc_root)
@@ -104,6 +167,11 @@ Server::Server(const char* addr, uint16_t port, const char* doc_root)
 , acceptor(context)
 , socket(context)
 {
+}
+
+void Server::add_handler(const char* path, std::function<void(const Request&, Response&)> handler)
+{
+	handlers.emplace(path, handler);
 }
 
 void Server::listen_and_serve()
@@ -126,30 +194,22 @@ void Server::accept()
 		if (!ec)
 		{
 			auto c = std::make_shared<Connection>(this, std::move(socket));
-			c->start();
 			connection_pool.insert(c);
+			c->start();
 		}
 
 		accept();
 	});
 }
 
-
-std::size_t print_line(char* buffer, std::size_t len)
+Server::Connection::~Connection()
 {
-	char line[256] = {0};
-	std::size_t n = 0;
-
-	while (n < 256 && n < len && buffer[n] != '\r') ++n;
-	std::memcpy(line, buffer, n);
-	std::printf("%s\n", line);
-
-	return n + 2; //  '\r\n'
+	//socket.close();
 }
 
 void Server::Connection::start() 
 {
-	read();
+	read_and_write();
 }
 
 void Server::Connection::stop()
@@ -157,56 +217,89 @@ void Server::Connection::stop()
 	socket.close();
 }
 
-void Server::Connection::read()
+void Server::Connection::read_and_write()
 {
-	socket.async_read_some(boost::asio::buffer(buffer, buffer.size()), [this](error_code ec, std::size_t size)
+	auto self(shared_from_this());
+	socket.async_read_some(boost::asio::buffer(buffer, buffer.size()), [this, self](error_code ec, std::size_t sz)
 	{
-		if (!ec)
+		if (!ec) 
 		{
-			try
+			auto [status, next_buffer_start, next_buffer_size] = parseRequest(buffer.data(), sz, request);
+			switch (status) 
 			{
-				switch (parseRequest(buffer.data(), size, request))
+				case ParserStatus::Done:
 				{
-					case ParserStatus::Done:
+					auto iter = server->handlers.find(request.path);
+					if (iter != server->handlers.end())
 					{
-						auto iter = server->handlers.find(request.path);
-						if (iter != server->handlers.end())
+						try
+						{
 							iter->second(request, response);
-
+						}
+						catch (std::exception& e)
+						{
+							response.status = Response::Status::ServerError;
+						}
+						catch (...)
+						{
+							response.status = Response::Status::ServerError;
+						}
 					}
-					case ParserStatus::More:
-					default:
+					else
 					{
-						server->stop_connection(shared_from_this());
-						return;
+						response.status = Response::Status::NotFound;
 					}
+
+					write(response);
+					return;
 				}
-			}
-			catch (std::exception& e)
-			{
-				std::printf("%s\n", e.what());
-			}
-			catch (...)
-			{
-				std::printf("error\n");
+				case ParserStatus::More:
+				{
+					//FIXME: do some more reading here or allow user to continue reading from request in the handler
+					(next_buffer_start);
+					(next_buffer_size);
+
+					return;
+				}
+				case ParserStatus::BadRequest:
+				default:
+				{
+					response.status = Response::Status::BadRequest;
+					write(response);
+					return;
+				}
 			}
 		}
 		else
 		{
-			write();
-			server->stop_connection(shared_from_this());
+			response.status = Response::Status::ServerError;
+			write(response);
 		}
 	});
 }
 
-void Server::Connection::write()
+void Server::Connection::write(Response& response)
 {
+	auto self(shared_from_this());
+	response.prepare();
+	boost::asio::async_write(socket, response.to_buffers(), [this, self](error_code ec, std::size_t sz)
+	{
+		if (!ec)
+		{
+			error_code ignore;
+			socket.shutdown(ip::tcp::socket::shutdown_both, ignore);
+		}
 
+	});
 }
 
 void Server::stop_connection(std::shared_ptr<Connection> c)
 {
-	connection_pool.erase(c);
+	{
+		//FIXME: lock if running in threads
+		connection_pool.erase(c);
+	}
+
 	c->stop();
 }
 
